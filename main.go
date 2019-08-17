@@ -10,24 +10,16 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"github.com/containerd/containerd/log"
-	"golang.org/x/sys/unix"
-
-	"github.com/sirupsen/logrus"
-
 	"github.com/containerd/console"
-
-	"github.com/containerd/containerd/cio"
-
-	"github.com/opencontainers/runtime-spec/specs-go"
-
-	"github.com/opencontainers/image-spec/identity"
-
-	"github.com/containerd/containerd/mount"
-
 	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/cio"
+	"github.com/containerd/containerd/log"
+	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/oci"
+	"github.com/opencontainers/image-spec/identity"
+	"github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -230,7 +222,7 @@ func main() {
 	if tty {
 		err := HandleConsoleResize(ctx, t, con)
 		if err != nil {
-			logrus.WithError(err).Error("console resize")
+			fail("resize: %v", err)
 		}
 	}
 
