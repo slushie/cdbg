@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"runtime"
 
+	"github.com/containerd/containerd/containers"
+
 	"github.com/containerd/console"
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/cio"
@@ -88,6 +90,10 @@ func main() {
 	if err != nil {
 		fail("spec: %v", err)
 	}
+	fmt.Println("mounts:")
+	for _, m := range spec.Mounts {
+		fmt.Printf("\t%#v\n", m)
+	}
 	t, err := c.Task(ctx, nil)
 	if err != nil {
 		fail("target task: %v", err)
@@ -164,13 +170,23 @@ func main() {
 		}
 	}()
 
+	// copy non-system mounts
+	var targetMounts []specs.Mount
+	for _, m := range spec.Mounts {
+		if m.Source[0] != '/' {
+			continue
+		}
+		targetMounts = append(targetMounts, m)
+	}
+
 	// create debug container in target pid space
 	dbgSpec := oci.Compose(
 		oci.WithDefaultSpec(),
 		oci.WithRootFSPath(root),
-		oci.WithTTY,
 		oci.WithImageConfigArgs(i, command),
-		// TODO add CAP_SYS_PTRACE
+		oci.WithMounts(targetMounts),
+		oci.WithTTY,
+		oci.WithNewPrivileges, // for gdb
 		oci.WithLinuxNamespace(specs.LinuxNamespace{
 			Type: "pid",
 			Path: fmt.Sprintf("/proc/%d/ns/pid", t.Pid()),
@@ -238,6 +254,21 @@ func main() {
 	status := <-exit
 	exitCode = int(status.ExitCode())
 	fmt.Println("done")
+}
+
+func WithAddedCapabilities(add ...string) oci.SpecOpts {
+	return func(ctx context.Context, client oci.Client, c *containers.Container, spec *oci.Spec) error {
+		for _, caps := range []*[]string{
+			&spec.Process.Capabilities.Ambient,
+			&spec.Process.Capabilities.Bounding,
+			&spec.Process.Capabilities.Effective,
+			&spec.Process.Capabilities.Inheritable,
+			&spec.Process.Capabilities.Permitted,
+		} {
+			*caps = append(*caps, add...)
+		}
+		return nil
+	}
 }
 
 // HandleConsoleResize resizes the console
