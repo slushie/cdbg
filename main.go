@@ -32,6 +32,7 @@ var (
 	image     = "docker.io/library/ubuntu:bionic"
 	command   = []string{"/bin/bash", "-l"}
 	id        = "cdbg"
+	readOnly  = true
 )
 
 func fail(msg string, args ...interface{}) {
@@ -52,6 +53,7 @@ func main() {
 	flag.StringVar(&address, "address", address, "Address of containerd")
 	flag.StringVar(&id, "id", id, "Unique ID for debug container")
 	flag.BoolVar(&tty, "tty", tty, "Allocate a TTY for the debug container")
+	flag.BoolVar(&readOnly, "ro", readOnly, "Debug container root FS is read-only")
 
 	flag.Parse()
 	args := flag.Args()
@@ -90,10 +92,6 @@ func main() {
 	if err != nil {
 		fail("spec: %v", err)
 	}
-	fmt.Println("mounts:")
-	for _, m := range spec.Mounts {
-		fmt.Printf("\t%#v\n", m)
-	}
 	t, err := c.Task(ctx, nil)
 	if err != nil {
 		fail("target task: %v", err)
@@ -126,39 +124,62 @@ func main() {
 			fail("remove: %v", err)
 		}
 	}()
+	fmt.Println("mounts:")
+	for _, m := range mounts {
+		fmt.Println("\t-", m)
+	}
 
 	// create scratch workspace
-	workDir, err := ioutil.TempDir("", "cdbg")
+	scratchDir, err := ioutil.TempDir("", "cdbg")
 	if err != nil {
 		fail("temp dir: %v", err)
 	}
-	defer os.RemoveAll(workDir)
-	dbgRoot := filepath.Join(workDir, "dbg")
-	err = os.MkdirAll(dbgRoot, 0777)
+	defer os.RemoveAll(scratchDir)
+	err = makeSubDirs(
+		scratchDir,
+		"dbg",
+		"root",
+		"fifos",
+		"upperdir",
+		"workdir",
+	)
 	if err != nil {
-		fail("dbg dir: %v", err)
+		fail("mkdir: %v", err)
 	}
 
 	// mount debug image snapshot into workspace
+	dbgRoot := filepath.Join(scratchDir, "dbg")
 	err = mount.All(mounts, dbgRoot)
 	if err != nil {
 		fail("mount all: %+v: %v", mounts, err)
 	}
-	defer mount.UnmountAll(dbgRoot, 0)
+	defer func() {
+		err = mount.UnmountAll(dbgRoot, 0)
+		if err != nil {
+			fail("unmount: %s: %v", dbgRoot, err)
+		}
+	}()
+
+	var overlayOpts []string
+	if readOnly {
+		overlayOpts = []string{
+			fmt.Sprintf("lowerdir=%s:%s", dbgRoot, spec.Root.Path),
+		}
+	} else {
+		overlayOpts = []string{
+			fmt.Sprintf("lowerdir=%s", spec.Root.Path),
+			fmt.Sprintf("upperdir=%s", filepath.Join(scratchDir, "upperdir")),
+			fmt.Sprintf("workdir=%s", filepath.Join(scratchDir, "workdir")),
+		}
+	}
 
 	// overlay of workspace snapshot over target container fs
 	overlay := mount.Mount{
-		Type:   "overlay",
-		Source: "overlay",
-		Options: []string{
-			fmt.Sprintf("lowerdir=%s:%s", dbgRoot, spec.Root.Path),
-		},
+		Type:    "overlay",
+		Source:  "overlay",
+		Options: overlayOpts,
 	}
-	root := filepath.Join(workDir, "root")
-	err = os.MkdirAll(root, 0777)
-	if err != nil {
-		fail("root: %v", err)
-	}
+	root := filepath.Join(scratchDir, "root")
 	err = overlay.Mount(root)
 	if err != nil {
 		fail("mount: overlay %+v: %v", overlay, err)
@@ -185,13 +206,17 @@ func main() {
 		oci.WithRootFSPath(root),
 		oci.WithImageConfigArgs(i, command),
 		oci.WithMounts(targetMounts),
-		oci.WithTTY,
-		oci.WithNewPrivileges, // for gdb
+		oci.WithNoNewPrivileges,                 // not privileged
+		WithAddedCapabilities("CAP_SYS_PTRACE"), // for gdb
+		oci.WithHostNamespace(specs.NetworkNamespace),
 		oci.WithLinuxNamespace(specs.LinuxNamespace{
 			Type: "pid",
 			Path: fmt.Sprintf("/proc/%d/ns/pid", t.Pid()),
 		}),
 	)
+	if tty {
+		dbgSpec = oci.Compose(dbgSpec, oci.WithTTY)
+	}
 	dbg, err := client.NewContainer(ctx, id,
 		containerd.WithNewSpec(dbgSpec))
 	if err != nil {
@@ -214,11 +239,7 @@ func main() {
 		if err != nil {
 			fail("console: %v", err)
 		}
-		fifos := filepath.Join(workDir, "fifos")
-		err = os.MkdirAll(fifos, 0777)
-		if err != nil {
-			fail("fifos: %v", err)
-		}
+		fifos := filepath.Join(scratchDir, "fifos")
 		opt = []cio.Opt{
 			cio.WithTerminal,
 			cio.WithStreams(con, con, nil),
@@ -254,6 +275,17 @@ func main() {
 	status := <-exit
 	exitCode = int(status.ExitCode())
 	fmt.Println("done")
+}
+
+func makeSubDirs(parent string, subdir ...string) error {
+	for _, sub := range subdir {
+		dir := filepath.Join(parent, sub)
+		err := os.MkdirAll(dir, 0777)
+		if err != nil {
+			return fmt.Errorf("%s: %v", dir, err)
+		}
+	}
+	return nil
 }
 
 func WithAddedCapabilities(add ...string) oci.SpecOpts {
